@@ -1,0 +1,4 @@
+// WinMon 资源：应用图标 + 应用清单
+// 图标资源 ID 1（LoadImageW 用 MAKEINTRESOURCEW(1) 加载）
+1 ICON "winmon.ico"
+1 24 "winmon.manifest"

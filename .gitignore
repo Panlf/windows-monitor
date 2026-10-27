@@ -1,0 +1,11 @@
+# Rust / Cargo
+/target
+
+# 构建产物目录
+/dist
+
+# 图标设计稿（成品已嵌入 winmon.ico）
+/icons
+
+# 运行日志
+*.log
