@@ -96,7 +96,8 @@ impl AdlPmLogDataOutput {
     }
 }
 
-/// PMLog 传感器 ID（LibreHardwareMonitor AtiAdlxx.cs ADLPMLogSensors）
+/// PMLog 传感器 ID（LibreHardwareMonitor AtiAdlxx.cs ADLPMLogSensors，与 AMD 官方 adl_defines.h 一致）
+const PMLOG_CLK_GFXCLK: usize = 1;
 const PMLOG_TEMPERATURE_EDGE: usize = 8;
 const PMLOG_TEMPERATURE_GFX: usize = 28;
 const PMLOG_TEMPERATURE_SOC: usize = 29;
@@ -126,6 +127,8 @@ pub struct Adl {
     adapter_index: i32,
     /// PMLog 优先使用的温度传感器 ID（探测阶段确定）
     pmlog_sensor: Option<usize>,
+    /// PMLog GFXCLK 频率传感器（探测阶段确定；RDNA2 核显上 OD5 老频率接口不可靠）
+    pmlog_clk: Option<usize>,
     /// 是否已记录首次采样诊断（只记一次，避免每轮刷屏）
     logged_sample: std::sync::atomic::AtomicBool,
 }
@@ -232,6 +235,7 @@ impl Adl {
             // 逐个探测适配器：优先挑能读到温度的（OD5 或 PMLog），否则退而求其次挑活动可读的
             let mut adapter_index: Option<i32> = None;
             let mut pmlog_sensor: Option<usize> = None;
+            let mut pmlog_clk: Option<usize> = None;
             for idx in 0..count {
                 // OD5 温度探测
                 let mut t = ADLTemperature {
@@ -239,8 +243,10 @@ impl Adl {
                     iTemperature: 0,
                 };
                 let tr = (temp_get)(context, idx, 0, &mut t);
-                // PMLog 温度探测：优先 GFX(28)，其次 EDGE(8)、SOC(29)
+                // PMLog 温度探测：优先 GFX(28)，其次 EDGE(8)、SOC(29)；同时探测 GFXCLK 频率
                 let mut pm_sensor: Option<(usize, i32, i32)> = None; // (sensor, supported, value)
+                let mut pm_clk: Option<usize> = None;
+                let mut gfxclk_info: Option<(i32, i32)> = None; // (supported, value)，仅诊断日志用
                 if let Some(q) = pmlog_query {
                     let mut log = AdlPmLogDataOutput::zeroed();
                     let qr = q(context, idx, &mut log);
@@ -255,6 +261,12 @@ impl Adl {
                                 pm_sensor = Some((id, s.supported, s.value));
                                 break;
                             }
+                        }
+                        // 核显频率 GFXCLK(1)：RDNA2 APU 上 OD5 活动接口的时钟值不可靠
+                        let c = &log.sensors[PMLOG_CLK_GFXCLK];
+                        gfxclk_info = Some((c.supported, c.value));
+                        if c.supported != 0 && (100..=10000).contains(&c.value) {
+                            pm_clk = Some(PMLOG_CLK_GFXCLK);
                         }
                     } else if idx == 0 {
                         util::debug_log(&format!("ADL: PMLog 查询返回 {}", qr));
@@ -273,8 +285,8 @@ impl Adl {
                 };
                 let ar = (activity_get)(context, idx, &mut act);
                 util::debug_log(&format!(
-                    "ADL: 探测 idx={} OD5温度接口={}（原值 {}） PMLog温度={:?} 活动接口={}（时钟 {} 使用率 {}）",
-                    idx, tr, t.iTemperature, pm_sensor, ar, act.iEngineClock, act.iActivityPercent
+                    "ADL: 探测 idx={} OD5温度接口={}（原值 {}） PMLog温度={:?} GFXCLK={:?} 活动接口={}（时钟 {} 使用率 {}）",
+                    idx, tr, t.iTemperature, pm_sensor, gfxclk_info, ar, act.iEngineClock, act.iActivityPercent
                 ));
                 let od5_ok = tr == 0 && (1..=150_000).contains(&t.iTemperature);
                 let pm_ok = pm_sensor
@@ -286,10 +298,12 @@ impl Adl {
                     if pm_ok && !od5_ok {
                         pmlog_sensor = pm_sensor.map(|(id, _, _)| id);
                     }
+                    pmlog_clk = pm_clk;
                     break;
                 }
                 if adapter_index.is_none() && ar == 0 {
                     adapter_index = Some(idx);
+                    pmlog_clk = pm_clk;
                 }
             }
             let Some(adapter_index) = adapter_index else {
@@ -300,9 +314,12 @@ impl Adl {
             };
 
             util::debug_log(&format!(
-                "ADL: 初始化成功，适配器 {}，PMLog温度传感器={}",
+                "ADL: 初始化成功，适配器 {}，PMLog温度传感器={}，PMLog频率传感器={}",
                 adapter_index,
                 pmlog_sensor
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "无".to_string()),
+                pmlog_clk
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "无".to_string())
             ));
@@ -315,6 +332,7 @@ impl Adl {
                 pmlog_query,
                 adapter_index,
                 pmlog_sensor,
+                pmlog_clk,
                 logged_sample: std::sync::atomic::AtomicBool::new(false),
             })
         }
@@ -352,6 +370,24 @@ impl Adl {
         None
     }
 
+    /// 从 PMLog 查询结果取 GPU 核心频率（MHz）
+    fn pmlog_clock(&self) -> Option<u32> {
+        let clk_id = self.pmlog_clk?;
+        let q = self.pmlog_query?;
+        let mut log = AdlPmLogDataOutput::zeroed();
+        let qr = unsafe { q(self.context, self.adapter_index, &mut log) };
+        if qr != 0 {
+            return None;
+        }
+        let s = &log.sensors[clk_id];
+        if s.supported == 0 {
+            return None;
+        }
+        // GFXCLK 单位 MHz；100~10000 之外视为无数据
+        let v = s.value as u32;
+        (100..=10000).contains(&v).then_some(v)
+    }
+
     pub fn sample(&self) -> AdlSample {
         let mut s = AdlSample {
             temp_c: None,
@@ -374,7 +410,10 @@ impl Adl {
                 s.temp_c = self.pmlog_temp();
             }
 
-            // 频率/使用率
+            // 频率：优先 PMLog GFXCLK（RDNA2 核显上 OD5 老接口的时钟值不可靠），无效退回 OD5
+            s.engine_mhz = self.pmlog_clock();
+
+            // 频率兜底/使用率
             let mut act = ADLPMActivity {
                 iSize: std::mem::size_of::<ADLPMActivity>() as i32,
                 iEngineClock: 0,
@@ -388,12 +427,14 @@ impl Adl {
             };
             let act_ret = (self.activity_get)(self.context, self.adapter_index, &mut act);
             if act_ret == 0 {
-                // 引擎频率：兼容两种单位（MHz 或 MHz*100）
-                let mhz = act.iEngineClock as u32;
-                let mhz = if mhz >= 10000 { mhz / 100 } else { mhz };
-                // 125MHz(空闲) 到 10GHz 之间视为有效
-                if (125..=10000).contains(&mhz) {
-                    s.engine_mhz = Some(mhz);
+                if s.engine_mhz.is_none() {
+                    // OD5 引擎频率：兼容两种单位（MHz 或 MHz*100）
+                    let mhz = act.iEngineClock as u32;
+                    let mhz = if mhz >= 10000 { mhz / 100 } else { mhz };
+                    // 125MHz(空闲) 到 10GHz 之间视为有效
+                    if (125..=10000).contains(&mhz) {
+                        s.engine_mhz = Some(mhz);
+                    }
                 }
                 if (0..=100).contains(&act.iActivityPercent) {
                     s.activity_pct = Some(act.iActivityPercent as f32);
