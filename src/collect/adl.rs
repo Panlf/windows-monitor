@@ -6,7 +6,7 @@
 //! 实现参考 LibreHardwareMonitor 的 AtiAdlxx / AmdGpu。
 
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW, LoadLibraryW};
 use windows::core::{PCSTR, PCWSTR};
 
 use crate::util;
@@ -17,18 +17,36 @@ extern "system" {
     fn GetProcAddress(hModule: HMODULE, lpProcName: PCSTR) -> *mut core::ffi::c_void;
 }
 
-// ADL 内部内存分配回调：用 C 运行库的 malloc（保证与 atiadlxx.dll 的 free 配对一致）
-#[link(name = "ucrt", kind = "dylib")]
-extern "C" {
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-
 /// ADL_Main_Memory_Alloc：`void* (*)(int iSize)`，返回分配的内存指针，失败返回 NULL
+///
+/// 必须用系统 ucrtbase.dll 的 malloc：atiadlxx.dll 内部用它自己加载的
+/// ucrtbase 的 free 释放回调分配的内存。exe 自身 CRT 即使静态化（crt-static）
+/// 也是独立堆，跨堆 free 会崩溃，所以这里运行时从 ucrtbase 动态取 malloc。
 extern "C" fn adl_malloc(size: i32) -> *mut core::ffi::c_void {
     if size <= 0 {
         return core::ptr::null_mut();
     }
-    unsafe { malloc(size as usize) }
+    unsafe {
+        type MallocFn = unsafe extern "C" fn(usize) -> *mut core::ffi::c_void;
+        static MALLOC_FN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let addr = *MALLOC_FN.get_or_init(|| {
+            let name = windows::core::w!("ucrtbase.dll");
+            // Win10/11 上 ucrtbase 是系统组件；atiadlxx.dll 已加载时它必然在进程内
+            let h = match GetModuleHandleW(name) {
+                Ok(h) => h,
+                Err(_) => LoadLibraryW(name).unwrap_or_default(),
+            };
+            if h.is_invalid() {
+                return 0usize;
+            }
+            GetProcAddress(h, PCSTR(b"malloc\0".as_ptr())) as usize
+        });
+        if addr == 0 {
+            return core::ptr::null_mut();
+        }
+        let f: MallocFn = std::mem::transmute(addr);
+        f(size as usize)
+    }
 }
 
 /// ADL2_Overdrive5_Temperature_Get 的参数

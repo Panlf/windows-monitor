@@ -18,8 +18,8 @@ copy /Y "target\release\winmon.exe" "%DIST%\winmon.exe" >nul
 if exist "winmon.manifest" copy /Y "winmon.manifest" "%DIST%\winmon.manifest" >nul
 
 echo.
-echo Packaging done: %DIST%\winmon.exe  (single file, ~286KB)
-echo  - Copy winmon.exe to another PC and run it directly (no install / no runtime needed).
+echo Packaging done: %DIST%\winmon.exe  (single file, ~660KB, CRT statically linked)
+echo  - Copy winmon.exe to another PC and run it directly (no install / no VC++ runtime needed).
 echo  - First start requests admin rights: allow it to read CPU/disk temperatures.
 echo  - GPU temp/frequency: NVIDIA via NVML, AMD via ADL; CPU temp needs admin rights.
 echo.

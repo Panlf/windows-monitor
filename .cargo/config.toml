@@ -1,0 +1,4 @@
+# 静态链接 CRT：exe 不再依赖目标机的 VCRUNTIME140.dll / api-ms-win-crt-*，
+# 拷到未装 VC++ 运行库的新机器可直接运行（单文件绿色部署）
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
