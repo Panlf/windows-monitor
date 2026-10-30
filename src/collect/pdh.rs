@@ -77,7 +77,18 @@ impl PdhQuery {
             }
             let item: &PDH_FMT_COUNTERVALUE_ITEM_W =
                 unsafe { &*(buf.as_ptr().add(off) as *const PDH_FMT_COUNTERVALUE_ITEM_W) };
-            let name = unsafe { util::wide_to_string(std::slice::from_raw_parts(item.szName.0, 256)) };
+            // szName 指向 buf 内部：按缓冲区末尾为界扫描到 \0，避免硬编码 256 越界读
+            let name_start: *const u16 = item.szName.0;
+            let buf_end: *const u16 = unsafe { buf.as_ptr().add(buf.len()) as *const u16 };
+            let mut len = 0usize;
+            unsafe {
+                let mut p = name_start;
+                while p < buf_end && *p != 0 {
+                    p = p.add(1);
+                    len += 1;
+                }
+            }
+            let name = unsafe { util::wide_to_string(std::slice::from_raw_parts(name_start, len)) };
             let val = unsafe { item.FmtValue.Anonymous.doubleValue };
             if val.is_finite() {
                 out.push((name, val));

@@ -1,5 +1,7 @@
 //! 设置窗口：桌面显示指标、记录指标、采集间隔、日志目录
 
+use std::sync::OnceLock;
+
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DEFAULT_CHARSET, FF_DONTCARE, FW_NORMAL, CLIP_DEFAULT_PRECIS, HFONT,
@@ -37,7 +39,24 @@ const IDC_BTN_BROWSE: u32 = 2203;
 const IDC_CHK_AUTOSTART: u32 = 2204;
 const IDC_STATUS: u32 = 2205;
 
-static mut FONT: HFONT = HFONT(std::ptr::null_mut());
+// GDI 字体缓存：创建一次复用（仅 UI 线程访问，Send/Sync 手工声明只为放进静态变量）
+struct FontHandle(HFONT);
+unsafe impl Send for FontHandle {}
+unsafe impl Sync for FontHandle {}
+
+static FONT: OnceLock<FontHandle> = OnceLock::new();
+
+fn font() -> HFONT {
+    FONT.get_or_init(|| {
+        FontHandle(unsafe {
+            CreateFontW(
+                -13, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                FF_DONTCARE.0 as u32, PCWSTR(util::wide("Microsoft YaHei UI").as_ptr()),
+            )
+        })
+    }).0
+}
 
 // 窗口创建期间使用的配置快照：
 // CreateWindowExW 会**同步**派发 WM_CREATE（其中的 fill_from_config 要读配置），
@@ -99,11 +118,6 @@ pub fn open() {
 /// 注册设置窗口类
 pub fn register(hinstance: windows::Win32::Foundation::HINSTANCE) {
     unsafe {
-        FONT = CreateFontW(
-            -13, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            FF_DONTCARE.0 as u32, PCWSTR(util::wide("Microsoft YaHei UI").as_ptr()),
-        );
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_STANDARD_CLASSES,
@@ -164,7 +178,7 @@ unsafe fn child(parent: HWND, class: &str, text: &str, style: u32, x: i32, y: i3
         None,
     )
     .unwrap_or_default();
-    SendMessageW(h, WM_SETFONT, Some(WPARAM(FONT.0 as usize)), Some(LPARAM(1)));
+    SendMessageW(h, WM_SETFONT, Some(WPARAM(font().0 as usize)), Some(LPARAM(1)));
     h
 }
 

@@ -118,6 +118,11 @@ impl Collector {
         s
     }
 
+    /// 只枚举盘符（建立 CSV 磁盘列用），不做全量采样、不重置差值基线
+    pub fn disk_names(&mut self) -> Vec<String> {
+        self.disk.drive_names()
+    }
+
     /// CPU 温度：优先内核驱动直读传感器，失败退回 PDH ACPI 热区（多数机器没有）
     fn cpu_temp_c(&self) -> Option<f32> {
         if let Some(r0) = &self.r0 {

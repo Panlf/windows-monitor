@@ -78,7 +78,8 @@ pub fn spawn(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                         metrics,
                     } => {
                         drop_recorder(&shared, recorder.take());
-                        let disks = disk_names(&mut collector);
+                        // 只取盘符建列，不做全量采样（避免重置 CPU/网络差值基线）
+                        let disks = collector.disk_names();
                         match Recorder::start(&dir, interval, &metrics, &disks) {
                             Ok(r) => {
                                 *shared.status.lock().unwrap() = Status::Recording { rows: 0 };
@@ -129,14 +130,4 @@ fn drop_recorder(shared: &Shared, r: Option<Recorder>) {
     }
     drop(r);
     let _ = shared;
-}
-
-/// 采集一轮拿到当前盘符列表（用于建立 CSV 磁盘列）
-fn disk_names(collector: &mut Collector) -> Vec<String> {
-    collector
-        .sample()
-        .disks
-        .into_iter()
-        .map(|d| d.name)
-        .collect()
 }

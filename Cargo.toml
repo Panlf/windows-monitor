@@ -36,5 +36,6 @@ windows = { version = "0.61", features = [
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# 不用 panic=abort：sampler 线程依赖 catch_unwind 兜底单次采样 panic，
+# abort 策略下 catch_unwind 捕获不到任何 panic，会直接杀死整个进程
 strip = true

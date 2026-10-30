@@ -141,7 +141,22 @@ impl Config {
             self.autostart_record as i32,
             self.warned_no_admin as i32,
         );
-        fs::write(path, s).map_err(|e| format!("写入配置文件失败：{}", e))
+        // 先写临时文件再替换（同目录 rename 原子），写入中途被杀也不会留下截断的配置
+        let tmp = path.with_extension("ini.tmp");
+        let write_direct = |body: &str| fs::write(path, body);
+        let write_atomic = |body: &str| -> std::io::Result<()> {
+            fs::write(&tmp, body)?;
+            match fs::rename(&tmp, path) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        };
+        write_atomic(&s)
+            .or_else(|_| write_direct(&s))
+            .map_err(|e| format!("写入配置文件失败：{}", e))
     }
 }
 

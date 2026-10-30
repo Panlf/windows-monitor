@@ -19,7 +19,8 @@ pub fn add(hwnd: HWND) {
     data.uCallbackMessage = super::WM_APP_TRAY;
     data.hIcon = super::app_icon();
     let tip = util::wide("WinMon 机器监控");
-    let n = tip.len().min(data.szTip.len());
+    // 保底留 1 位放 \0（tip 超 szTip 容量时截断且保证 null 结尾）
+    let n = tip.len().min(data.szTip.len() - 1);
     data.szTip[..n].copy_from_slice(&tip[..n]);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &data);

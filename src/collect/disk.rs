@@ -124,6 +124,8 @@ impl IoCounters {
 pub struct DiskState {
     drives: Vec<u8>,                    // 盘符字母，如 C、D
     temps: Vec<Option<f32>>,
+    /// 磁盘占用率/容量缓存：变化极慢，与温度同周期刷新即可，不必每秒查
+    usage: Vec<(f32, f32, f32)>,
     last_temp: Option<Instant>,
     io: Option<IoCounters>,
 }
@@ -143,9 +145,15 @@ impl DiskState {
         DiskState {
             drives: enumerate_fixed_drives(),
             temps: Vec::new(),
+            usage: Vec::new(),
             last_temp: None,
             io,
         }
+    }
+
+    /// 当前盘符列表（用于建立 CSV 磁盘列），不做全量采样
+    pub fn drive_names(&self) -> Vec<String> {
+        self.drives.iter().map(|&d| (d as char).to_string()).collect()
     }
 
     /// 返回 (各磁盘状态, 全机读速率 bps, 全机写速率 bps)
@@ -155,15 +163,17 @@ impl DiskState {
         if drives != self.drives {
             self.drives = drives;
             self.temps.clear();
+            self.usage.clear();
             self.last_temp = None;
         }
 
-        let need_temp = match self.last_temp {
+        let need_refresh = match self.last_temp {
             Some(t) => t.elapsed() >= Duration::from_secs(TEMP_REFRESH_SECS),
             None => true,
         };
-        if need_temp {
+        if need_refresh {
             self.temps = self.drives.iter().map(|&d| read_disk_temp(d)).collect();
+            self.usage = self.drives.iter().map(|&d| disk_usage(d)).collect();
             self.last_temp = Some(Instant::now());
         }
 
@@ -171,7 +181,8 @@ impl DiskState {
 
         let mut out = Vec::with_capacity(self.drives.len());
         for (i, &d) in self.drives.iter().enumerate() {
-            let (used_pct, total_gb, free_gb) = disk_usage(d);
+            let (used_pct, total_gb, free_gb) =
+                self.usage.get(i).copied().unwrap_or((0.0, 0.0, 0.0));
             out.push(DiskSample {
                 name: format!("{}", d as char),
                 used_pct,

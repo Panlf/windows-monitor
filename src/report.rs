@@ -605,7 +605,9 @@ fn fmt_dur(secs: i64) -> String {
 
 /// Unix 时间戳 → 本地 "YYYY-MM-DD HH:MM:SS"
 fn fmt_time(t: i64) -> String {
-    let secs = t + TZ_OFFSET_MINUTES.load(Ordering::Relaxed) * 60;
+    // 饱和运算：CSV 的 time 列可被手工编辑成任意大数，防止溢出 panic
+    let offset = TZ_OFFSET_MINUTES.load(Ordering::Relaxed).saturating_mul(60);
+    let secs = t.saturating_add(offset);
     let days = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400);
     let (y, mo, d) = civil_from_days(days);
@@ -622,7 +624,12 @@ fn fmt_time(t: i64) -> String {
 
 fn fmt_time_short(t: i64) -> String {
     let s = fmt_time(t);
-    s[5..16].to_string() // MM-DD HH:MM
+    // 年份超 4 位（异常大时间戳）时按原样返回，避免切片越界 panic
+    if s.len() >= 19 {
+        s[5..16].to_string() // MM-DD HH:MM
+    } else {
+        s
+    }
 }
 
 /// 1970 起的天数 → 公历年月日（Howard Hinnant 算法）

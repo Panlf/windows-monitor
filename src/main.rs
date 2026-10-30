@@ -138,6 +138,7 @@ fn main() {
 
     ui::tray::remove(overlay_hwnd);
     ui::save_config();
+    ui::join_report_threads(); // 等待在途报告线程写完 HTML
     sampler_handle.join().ok();
     unsafe {
         let _ = CloseHandle(mutex);

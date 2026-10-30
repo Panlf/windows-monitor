@@ -150,25 +150,20 @@ pub fn stop_record() {
     with_ctx(|ctx| ctx.shared.push_cmd(Cmd::Stop));
 }
 
+/// 在途的报告生成线程句柄：退出前统一 join，防止进程退出时 HTML 被写一半
+static REPORT_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
 /// 生成深度分析报告：分析日志目录中最新的 CSV，输出 HTML 并用浏览器打开
 pub fn generate_report() {
-    let (dir, csv) = match with_ctx(|ctx| {
-        (
-            ctx.config.record_dir.clone(),
-            crate::recorder::latest_csv(&ctx.config.record_dir),
-        )
-    }) {
-        Some(v) => v,
-        None => return,
+    // 只取目录字符串，遍历目录（磁盘 IO）放到锁外做，避免阻塞其他 with_ctx 调用
+    let Some(dir) = with_ctx(|ctx| ctx.config.record_dir.clone()) else {
+        return;
     };
-    let csv = match csv {
-        Some(c) => c,
-        None => {
-            msg_info("日志目录中没有采集数据文件，请先开始记录。");
-            return;
-        }
+    let Some(csv) = crate::recorder::latest_csv(&dir) else {
+        msg_info("日志目录中没有采集数据文件，请先开始记录。");
+        return;
     };
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let out = report_path(&dir);
         // 用当前本地时区偏移渲染报告时间，避免硬编码 +8 在其它时区错位
         let offset = util::tz_offset_minutes(util::now_unix());
@@ -180,6 +175,18 @@ pub fn generate_report() {
             Err(e) => msg_error(&format!("生成分析报告失败：{}", e)),
         }
     });
+    if let Ok(mut list) = REPORT_THREADS.lock() {
+        list.retain(|t| !t.is_finished());
+        list.push(handle);
+    }
+}
+
+/// 退出前等待在途报告线程结束（正常情况下报告很快生成完，不会阻塞退出）
+pub fn join_report_threads() {
+    let Ok(mut list) = REPORT_THREADS.lock() else { return };
+    for h in list.drain(..) {
+        let _ = h.join();
+    }
 }
 
 fn report_path(dir: &str) -> PathBuf {

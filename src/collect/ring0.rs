@@ -15,8 +15,9 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, StartServiceW, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START,
-    SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_STATUS, SC_MANAGER_CREATE_SERVICE,
+    OpenServiceW, StartServiceW, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
+    SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+    SERVICE_KERNEL_DRIVER, SERVICE_STATUS,
 };
 
 /// 内嵌驱动（来自 LibreHardwareMonitor v0.9.4 资源，SHA256
@@ -49,6 +50,23 @@ struct WritePciIn {
 
 pub struct Ring0 {
     device: HANDLE,
+    /// 对应的内核驱动服务名（Drop 时停止并删除）
+    service_name: String,
+}
+
+/// 服务名沿用 LHM 规则：R0 + exe 名（避免与其他工具冲突）
+fn service_name() -> String {
+    let exe_stem = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "winmon".to_string());
+    format!(
+        "R0{}",
+        exe_stem
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    )
 }
 
 impl Ring0 {
@@ -76,26 +94,17 @@ impl Ring0 {
                 None,
             )
             .ok();
-            h.map(|device| Ring0 { device })
+            h.map(|device| Ring0 {
+                device,
+                service_name: service_name(),
+            })
         }
     }
 
     /// 释放驱动文件 + 注册/启动内核驱动服务
     fn install() -> Result<(), String> {
         let sys_path = extract_driver()?;
-
-        // 服务名沿用 LHM 规则：R0 + exe 名（避免与其他工具冲突）
-        let exe_stem = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "winmon".to_string());
-        let service_name = format!(
-            "R0{}",
-            exe_stem
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-        );
+        let service_name = service_name();
 
         unsafe {
             let mgr = OpenSCManagerW(None, None, SC_MANAGER_CREATE_SERVICE)
@@ -213,6 +222,21 @@ impl Drop for Ring0 {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.device);
+            // 用完即卸：停止并删除内核驱动服务。WinRing0 不限制调用者，
+            // 常驻内核等于给机器上任意低权限进程留一个本地提权入口。
+            if let Ok(mgr) = OpenSCManagerW(None, None, SC_MANAGER_CONNECT) {
+                if let Ok(svc) = OpenServiceW(
+                    mgr,
+                    PCWSTR(util::wide(&self.service_name).as_ptr()),
+                    SERVICE_ALL_ACCESS,
+                ) {
+                    let mut st = SERVICE_STATUS::default();
+                    let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut st);
+                    let _ = DeleteService(svc);
+                    let _ = CloseServiceHandle(svc);
+                }
+                let _ = CloseServiceHandle(mgr);
+            }
         }
     }
 }
@@ -220,17 +244,19 @@ impl Drop for Ring0 {
 /// 释放驱动文件到磁盘，返回路径
 fn extract_driver() -> Result<std::path::PathBuf, String> {
     let path = util::exe_dir().join("winmon_ring0.sys");
-    let target = if std::fs::metadata(&path).map(|m| m.len() == DRIVER_SYS.len() as u64).unwrap_or(false) {
-        path
-    } else if std::fs::write(&path, DRIVER_SYS).is_ok() {
-        path
-    } else {
-        // exe 目录不可写时退回临时目录
-        let p = std::env::temp_dir().join("winmon_ring0.sys");
-        std::fs::write(&p, DRIVER_SYS).map_err(|e| format!("释放驱动文件失败: {e}"))?;
-        p
-    };
-    Ok(target)
+    // 已存在的文件必须与内嵌驱动逐字节一致（仅比长度防不住被替换的同长文件）
+    if let Ok(existing) = std::fs::read(&path) {
+        if existing == DRIVER_SYS {
+            return Ok(path);
+        }
+    }
+    if std::fs::write(&path, DRIVER_SYS).is_ok() {
+        return Ok(path);
+    }
+    // exe 目录不可写时退回临时目录
+    let p = std::env::temp_dir().join("winmon_ring0.sys");
+    std::fs::write(&p, DRIVER_SYS).map_err(|e| format!("释放驱动文件失败: {e}"))?;
+    Ok(p)
 }
 
 use crate::util;
