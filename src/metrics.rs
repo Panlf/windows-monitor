@@ -88,7 +88,21 @@ impl Metric {
     pub fn is_disk(self) -> bool {
         matches!(self, Metric::DiskUsage | Metric::DiskTemp)
     }
+
+    /// 悬浮窗分组标题（不同类别分层显示）
+    pub fn category(self) -> &'static str {
+        match self {
+            Metric::CpuUsage | Metric::CpuFreq | Metric::CpuTemp => "CPU",
+            Metric::MemUsage => "内存",
+            Metric::GpuUsage | Metric::GpuFreq | Metric::GpuTemp | Metric::GpuMem => "GPU",
+            Metric::NetDown | Metric::NetUp => "网络",
+            Metric::DiskRead | Metric::DiskWrite | Metric::DiskUsage | Metric::DiskTemp => "磁盘",
+        }
+    }
 }
+
+/// 悬浮窗分组的固定顺序（与用户勾选顺序无关，保证类别层次稳定）
+pub const CATEGORY_ORDER: [&str; 5] = ["CPU", "内存", "GPU", "网络", "磁盘"];
 
 /// 单个磁盘的一次采样
 #[derive(Clone, Debug)]

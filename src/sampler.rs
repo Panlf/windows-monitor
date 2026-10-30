@@ -20,7 +20,9 @@ pub enum Cmd {
     Stop,
 }
 
-/// 记录状态（供界面显示）
+/// 记录状态（供界面显示；悬浮窗只显示状态点，rows 计数与错误详情不再展示，
+/// 错误详情在产生时写诊断日志，避免信息丢失）
+#[allow(dead_code)]
 pub enum Status {
     Idle,
     Recording {
@@ -86,6 +88,7 @@ pub fn spawn(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                                 recorder = Some(r);
                             }
                             Err(e) => {
+                                util::debug_log(&format!("记录启动失败：{}", e));
                                 *shared.status.lock().unwrap() = Status::Error(e);
                             }
                         }

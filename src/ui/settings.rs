@@ -2,10 +2,10 @@
 
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DEFAULT_CHARSET, FF_DONTCARE, FW_NORMAL, CLIP_DEFAULT_PRECIS, HFONT,
-    OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY, COLOR_BTNFACE,
+    CreateFontW, CreateSolidBrush, SetBkMode, SetTextColor, DEFAULT_CHARSET, FF_DONTCARE, FW_NORMAL,
+    CLIP_DEFAULT_PRECIS, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
     LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow,
     BM_GETCHECK, BM_SETCHECK, CW_USEDEFAULT, HMENU, IDC_ARROW, SW_SHOWNORMAL,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_GETTEXT, WM_SETFONT,
+    WM_CLOSE,     WM_COMMAND, WM_CREATE, WM_GETTEXT, WM_SETFONT, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
     WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
@@ -44,7 +44,12 @@ struct FontHandle(HFONT);
 unsafe impl Send for FontHandle {}
 unsafe impl Sync for FontHandle {}
 
+struct BrushHandle(HBRUSH);
+unsafe impl Send for BrushHandle {}
+unsafe impl Sync for BrushHandle {}
+
 static FONT: OnceLock<FontHandle> = OnceLock::new();
+static BRUSH_BG: OnceLock<BrushHandle> = OnceLock::new();
 
 fn font() -> HFONT {
     FONT.get_or_init(|| {
@@ -56,6 +61,17 @@ fn font() -> HFONT {
             )
         })
     }).0
+}
+
+/// 浅蓝灰白背景（清新不刺眼），窗口与控件共用
+fn bg_brush() -> HBRUSH {
+    BRUSH_BG
+        .get_or_init(|| {
+            BrushHandle(unsafe {
+                CreateSolidBrush(COLORREF(0xFA_F7_F5)) // RGB(245,247,250)
+            })
+        })
+        .0
 }
 
 // 窗口创建期间使用的配置快照：
@@ -133,9 +149,7 @@ pub fn register(hinstance: windows::Win32::Foundation::HINSTANCE) {
             hInstance: hinstance,
             hIcon: super::app_icon(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
-                (COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void,
-            ),
+            hbrBackground: bg_brush(),
             lpszMenuName: windows::core::w!(""),
             lpszClassName: PCWSTR(cls.as_ptr()),
         };
@@ -395,6 +409,15 @@ pub(super) unsafe extern "system" fn wnd_proc(
             build_controls(hwnd);
             fill_from_config(hwnd);
             LRESULT(0)
+        }
+        // 浅色清新主题：静态文本/分组框/复选按钮文字统一深灰蓝，背景浅色
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            unsafe {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+                SetTextColor(hdc, COLORREF(0x44_35_2C)); // RGB(44,53,68)
+                SetBkMode(hdc, TRANSPARENT);
+            }
+            LRESULT(bg_brush().0 as isize)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
