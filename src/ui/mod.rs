@@ -44,6 +44,10 @@ unsafe impl Send for UiCtx {}
 /// 全局 UI 上下文（主线程访问；采样线程只用 shared）
 pub static CTX: Mutex<Option<UiCtx>> = Mutex::new(None);
 
+/// 测试串行锁：多个 UI 测试共用全局 CTX，必须互斥运行避免互相覆盖上下文
+#[cfg(test)]
+pub static UI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// 从 exe 资源加载应用图标（资源 ID 1，见 winmon.rc）；失败回退系统默认图标
 pub fn app_icon() -> windows::Win32::UI::WindowsAndMessaging::HICON {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -270,6 +274,7 @@ mod tests {
     /// 界面线程会把自己锁死（表现为程序无响应）。本用例若回归会直接挂住而非失败。
     #[test]
     fn settings_open_does_not_deadlock() {
+        let _guard = UI_TEST_LOCK.lock().unwrap();
         unsafe {
             let hinstance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
                 .unwrap_or_default();
@@ -290,6 +295,7 @@ mod tests {
     /// 上下文锁重入时必须降级而不是死锁（防御：即便将来有人写错也不会卡死界面）
     #[test]
     fn with_ctx_reentrant_degrades() {
+        let _guard = UI_TEST_LOCK.lock().unwrap();
         *CTX.lock().unwrap() = Some(UiCtx {
             shared: Shared::new(1),
             config: Config::default(),

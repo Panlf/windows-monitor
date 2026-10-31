@@ -92,7 +92,6 @@ fn main() {
         hinstance,
         cfg.overlay_x,
         cfg.overlay_y,
-        cfg.overlay_opacity,
         cfg.overlay_visible,
     );
 

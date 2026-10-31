@@ -2,25 +2,32 @@
 
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, SetBkMode, SetTextColor, DEFAULT_CHARSET, FF_DONTCARE, FW_NORMAL,
-    CLIP_DEFAULT_PRECIS, HBRUSH, HFONT, OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY, TRANSPARENT,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawFocusRect, DrawTextW, RoundRect,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT,
+    HGDIOBJ, OUT_DEFAULT_PRECIS, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, BST_CHECKED,
+    InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, BST_CHECKED, DRAWITEMSTRUCT,
+    ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, SetWindowTheme,
 };
 use windows::Win32::UI::Shell::{
     SHBrowseForFolderW, SHGetPathFromIDListW, BIF_RETURNONLYFSDIRS, BROWSEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextLengthW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowLongPtrW, GetWindowTextLengthW,
     LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow,
-    BM_GETCHECK, BM_SETCHECK, CW_USEDEFAULT, HMENU, IDC_ARROW, SW_SHOWNORMAL,
-    WM_CLOSE,     WM_COMMAND, WM_CREATE, WM_GETTEXT, WM_SETFONT, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
-    WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, WINDOW_EX_STYLE, WINDOW_STYLE,
+    BM_GETCHECK, BM_SETCHECK, BS_AUTO3STATE, BS_AUTOCHECKBOX, BS_CHECKBOX, BS_OWNERDRAW,
+    BS_TYPEMASK, CW_USEDEFAULT, GWL_ID, GWL_STYLE, HMENU, IDC_ARROW, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_GETTEXT,
+    WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, BS_GROUPBOX, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -50,6 +57,34 @@ unsafe impl Sync for BrushHandle {}
 
 static FONT: OnceLock<FontHandle> = OnceLock::new();
 static BRUSH_BG: OnceLock<BrushHandle> = OnceLock::new();
+static BRUSH_CARD: OnceLock<BrushHandle> = OnceLock::new();
+static BRUSH_EDIT: OnceLock<BrushHandle> = OnceLock::new();
+
+fn color(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+/// 让设置窗口的标题栏（非客户区）也变深色，与悬浮窗深暖灰主体一致
+fn enable_dark_titlebar(hwnd: HWND) {
+    unsafe {
+        // 深色标题栏 + 白字（Win10 1903+，Build 19045 支持）
+        let enable: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &enable as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // 标题栏底色设成与主体一致的深暖灰，避免默认纯黑太生硬
+        let c = color(44, 42, 41);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &c as *const COLORREF as *const core::ffi::c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+    }
+}
 
 fn font() -> HFONT {
     FONT.get_or_init(|| {
@@ -63,12 +98,42 @@ fn font() -> HFONT {
     }).0
 }
 
-/// 浅蓝灰白背景（清新不刺眼），窗口与控件共用
+/// 深暖灰背景（与悬浮窗深玻璃主题一致），窗口与静态文本/分组框/复选按钮共用
 fn bg_brush() -> HBRUSH {
     BRUSH_BG
         .get_or_init(|| {
             BrushHandle(unsafe {
-                CreateSolidBrush(COLORREF(0xFA_F7_F5)) // RGB(245,247,250)
+                CreateSolidBrush(COLORREF(0x2C_2A_29)) // RGB(44,42,41)
+            })
+        })
+        .0
+}
+
+/// 判断按钮控件是否为复选类（复选/自动复选/三态），决定文字用白色还是深色
+unsafe fn is_checkbox(h: HWND) -> bool {
+    let style = GetWindowLongPtrW(h, GWL_STYLE) as i32;
+    let kind = style & BS_TYPEMASK;
+    kind == BS_CHECKBOX || kind == BS_AUTOCHECKBOX || kind == BS_AUTO3STATE
+}
+
+/// 分组卡片底色：比窗口底亮一档，让三个分组区域从深底里"浮"出一层（层次感的来源）
+fn card_brush() -> HBRUSH {
+    BRUSH_CARD
+        .get_or_init(|| {
+            BrushHandle(unsafe {
+                CreateSolidBrush(COLORREF(0x2F_31_34)) // RGB(52,49,47)，比窗口底 (44,42,41) 亮一档
+            })
+        })
+        .0
+}
+
+/// 输入框底色：比卡片再亮一档（RGB(60,58,56)），突出输入区；
+/// 与 WM_CTLCOLOREDIT 里 SetBkColor 保持一致，否则文字底色块
+fn edit_brush() -> HBRUSH {
+    BRUSH_EDIT
+        .get_or_init(|| {
+            BrushHandle(unsafe {
+                CreateSolidBrush(COLORREF(0x38_3A_3C)) // RGB(60,58,56)
             })
         })
         .0
@@ -111,7 +176,7 @@ pub fn open() {
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             470,
-            585,
+            660,
             None,
             None,
             Some(hinstance.into()),
@@ -193,13 +258,18 @@ unsafe fn child(parent: HWND, class: &str, text: &str, style: u32, x: i32, y: i3
     )
     .unwrap_or_default();
     SendMessageW(h, WM_SETFONT, Some(WPARAM(font().0 as usize)), Some(LPARAM(1)));
+    // 禁用视觉主题：带主题时按钮/编辑框会忽略 WM_CTLCOLOR 返回的深色画刷，
+    // 关掉后经典样式 + 深底画刷才能统一接管，整窗配色不再"只换背景"
+    if class == "BUTTON" || class == "EDIT" {
+        let _ = SetWindowTheme(h, windows::core::w!(""), windows::core::w!(""));
+    }
     h
 }
 
 unsafe fn build_controls(parent: HWND) {
     // ---- 桌面显示指标 ----
-    // 14 个指标用 3 列 × 5 行排列（列距 138、宽 130，刚好放进 430 宽的分组框）
-    child(parent, "BUTTON", "桌面显示指标（显示在悬浮窗上，可多选）", BS_GROUPBOX as u32, 12, 10, 430, 132, 1);
+    // 14 个指标 3 列 × 5 行（列距 138、行距 22，组内上下留白 ≥12px）
+    child(parent, "BUTTON", "桌面显示指标（显示在悬浮窗上，可多选）", BS_GROUPBOX as u32, 12, 10, 430, 148, 1);
     for (i, m) in ALL_METRICS.iter().enumerate() {
         let col = (i / 5) as i32;
         let row = (i % 5) as i32;
@@ -209,7 +279,7 @@ unsafe fn build_controls(parent: HWND) {
             m.label(),
             BS_AUTOCHECKBOX as u32,
             26 + col * 138,
-            34 + row * 18,
+            40 + row * 22,
             130,
             18,
             IDC_DISP_BASE + i as u32,
@@ -218,7 +288,7 @@ unsafe fn build_controls(parent: HWND) {
     }
 
     // ---- 记录指标 ----
-    child(parent, "BUTTON", "记录指标（写入 CSV 的列，可多选）", BS_GROUPBOX as u32, 12, 150, 430, 132, 2);
+    child(parent, "BUTTON", "记录指标（写入 CSV 的列，可多选）", BS_GROUPBOX as u32, 12, 170, 430, 148, 2);
     for (i, m) in ALL_METRICS.iter().enumerate() {
         let col = (i / 5) as i32;
         let row = (i % 5) as i32;
@@ -228,7 +298,7 @@ unsafe fn build_controls(parent: HWND) {
             m.label(),
             BS_AUTOCHECKBOX as u32,
             26 + col * 138,
-            174 + row * 18,
+            200 + row * 22,
             130,
             18,
             IDC_REC_BASE + i as u32,
@@ -236,25 +306,26 @@ unsafe fn build_controls(parent: HWND) {
         set_check(h, true);
     }
 
-    // ---- 采集设置 ----
-    child(parent, "BUTTON", "采集与记录设置", BS_GROUPBOX as u32, 12, 290, 430, 118, 3);
-    child(parent, "STATIC", "桌面刷新间隔(秒)", 0, 26, 314, 130, 18, 4);
-    child(parent, "EDIT", "", WS_TABSTOP.0, 156, 311, 70, 22, IDC_EDIT_REFRESH);
-    child(parent, "STATIC", "记录间隔(秒)", 0, 250, 314, 100, 18, 5);
-    child(parent, "EDIT", "", WS_TABSTOP.0, 350, 311, 70, 22, IDC_EDIT_REC_INTERVAL);
-    child(parent, "STATIC", "日志目录（采集数据 CSV 与分析报告的存放位置）", 0, 26, 342, 400, 18, 6);
-    child(parent, "EDIT", "", WS_TABSTOP.0, 26, 362, 318, 22, IDC_EDIT_DIR);
-    child(parent, "BUTTON", "浏览...", WS_TABSTOP.0, 352, 361, 72, 24, IDC_BTN_BROWSE);
-    child(parent, "BUTTON", "启动时自动开始记录", BS_AUTOCHECKBOX as u32, 26, 388, 200, 18, IDC_CHK_AUTOSTART);
+    // ---- 采集设置（行距放宽：标题区 32px、目录区 22px/22px、自动记录 30px） ----
+    child(parent, "BUTTON", "采集与记录设置", BS_GROUPBOX as u32, 12, 330, 430, 150, 3);
+    child(parent, "STATIC", "桌面刷新间隔(秒)", 0, 26, 362, 130, 18, 4);
+    child(parent, "EDIT", "", WS_TABSTOP.0, 158, 359, 70, 22, IDC_EDIT_REFRESH);
+    child(parent, "STATIC", "记录间隔(秒)", 0, 250, 362, 90, 18, 5);
+    child(parent, "EDIT", "", WS_TABSTOP.0, 344, 359, 72, 22, IDC_EDIT_REC_INTERVAL);
+    child(parent, "STATIC", "日志目录（采集数据 CSV 与分析报告的存放位置）", 0, 26, 394, 400, 18, 6);
+    child(parent, "EDIT", "", WS_TABSTOP.0, 26, 416, 320, 22, IDC_EDIT_DIR);
+    // 浏览按钮与左侧目录输入框垂直居中（两者中线同为 y=427）
+    child(parent, "BUTTON", "浏览...", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 354, 415, 76, 24, IDC_BTN_BROWSE);
+    child(parent, "BUTTON", "启动时自动开始记录", BS_AUTOCHECKBOX as u32, 26, 448, 200, 18, IDC_CHK_AUTOSTART);
 
-    // ---- 动作按钮 ----
-    child(parent, "BUTTON", "开始记录", WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, 12, 424, 102, 28, super::CMD_START_RECORD);
-    child(parent, "BUTTON", "停止记录", WS_TABSTOP.0, 120, 424, 102, 28, super::CMD_STOP_RECORD);
-    child(parent, "BUTTON", "生成分析报告", WS_TABSTOP.0, 228, 424, 102, 28, super::CMD_REPORT);
-    child(parent, "BUTTON", "打开日志目录", WS_TABSTOP.0, 336, 424, 106, 28, super::CMD_OPEN_DIR);
-    child(parent, "BUTTON", "保存设置", WS_TABSTOP.0, 12, 462, 102, 28, 2300);
-    child(parent, "BUTTON", "退出程序", WS_TABSTOP.0, 120, 462, 102, 28, 2301);
-    child(parent, "STATIC", "", 0, 12, 502, 430, 20, IDC_STATUS);
+    // ---- 动作按钮（2 行 × 3 个均匀网格：x=12/158/304，宽 138，列完全对齐） ----
+    child(parent, "BUTTON", "开始记录", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 12, 496, 138, 28, super::CMD_START_RECORD);
+    child(parent, "BUTTON", "停止记录", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 158, 496, 138, 28, super::CMD_STOP_RECORD);
+    child(parent, "BUTTON", "生成分析报告", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 304, 496, 138, 28, super::CMD_REPORT);
+    child(parent, "BUTTON", "打开日志目录", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 12, 534, 138, 28, super::CMD_OPEN_DIR);
+    child(parent, "BUTTON", "保存设置", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 158, 534, 138, 28, 2300);
+    child(parent, "BUTTON", "退出程序", BS_OWNERDRAW as u32 | WS_TABSTOP.0, 304, 534, 138, 28, 2301);
+    child(parent, "STATIC", "", 0, 12, 574, 430, 20, IDC_STATUS);
 }
 
 unsafe fn set_check(h: HWND, checked: bool) {
@@ -349,6 +420,89 @@ unsafe fn set_status(parent: HWND, text: &str) {
     set_text(parent, IDC_STATUS, text);
 }
 
+/// 读按钮窗口文本（null 结尾 UTF-16，供自绘按钮 DrawText 用）
+unsafe fn read_button_text(h: HWND) -> Vec<u16> {
+    let len = GetWindowTextLengthW(h) as usize;
+    let mut buf = vec![0u16; len + 2];
+    let n = SendMessageW(
+        h,
+        WM_GETTEXT,
+        Some(WPARAM(buf.len())),
+        Some(LPARAM(buf.as_mut_ptr() as isize)),
+    );
+    // 截断到"实际文本 + 1 个 null"：尾随多余的 0 会让 DrawTextW 的 DT_CENTER
+    // 测宽偏移，文字看起来偏左
+    buf.truncate(n.0 as usize + 1);
+    buf
+}
+
+/// owner-draw 按钮：深色圆角底 + 白字，按下/禁用有反馈，主/次/危险用语义色区分
+unsafe fn draw_button(di: &DRAWITEMSTRUCT) {
+    let hdc = di.hDC;
+    let rc = &di.rcItem;
+    let state = di.itemState.0;
+    let pressed = state & ODS_SELECTED.0 != 0;
+    let disabled = state & ODS_DISABLED.0 != 0;
+    let focused = state & ODS_FOCUS.0 != 0;
+
+    // 默认：深灰底白字（比卡片/输入框更亮一档，提示"可点"）
+    let mut bg = if pressed { color(88, 84, 80) } else { color(70, 67, 64) };
+    let mut border = color(104, 100, 96);
+    let mut fg = color(242, 240, 238);
+    if disabled {
+        bg = color(50, 48, 47);
+        border = color(70, 68, 66);
+        fg = color(122, 120, 118);
+    }
+    // 语义色只留一个：退出程序 = 破坏性操作用暗红（iOS 惯例）；
+    // 其余全部统一中性深灰，避免多色混杂（2绿+1红+3灰显得杂乱）
+    match di.CtlID {
+        2301 => {
+            // 退出程序：暗红
+            bg = if pressed { color(118, 50, 46) } else { color(146, 62, 56) };
+            border = color(170, 82, 74);
+            fg = color(255, 255, 255);
+        }
+        _ => {}
+    }
+
+    // 圆角底 + 描边
+    let br = CreateSolidBrush(bg);
+    let pen = CreatePen(PS_SOLID, 1, border);
+    let old_br = SelectObject(hdc, HGDIOBJ(br.0));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+    SelectObject(hdc, old_br);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(br.0));
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+
+    // 键盘焦点：内缩虚线框（深底上呈亮虚线）
+    if focused {
+        let fr = RECT {
+            left: rc.left + 3,
+            top: rc.top + 3,
+            right: rc.right - 3,
+            bottom: rc.bottom - 3,
+        };
+        let _ = DrawFocusRect(hdc, &fr);
+    }
+
+    // 文字居中（整体下移 1px：中文 YaHei 在 DT_VCENTER 下视觉重心偏上，做视觉居中修正）
+    let text = read_button_text(di.hwndItem);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, fg);
+    SelectObject(hdc, HGDIOBJ(font().0));
+    let mut tr = RECT {
+        left: rc.left,
+        top: rc.top + 1,
+        right: rc.right,
+        bottom: rc.bottom + 1,
+    };
+    let mut t = text;
+    let _ = DrawTextW(hdc, &mut t, &mut tr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
 unsafe fn fill_from_config(parent: HWND) {
     // 不访问全局上下文：本函数由 WM_CREATE 同步触发，外层可能正持有该锁（重入会死锁）
     let Some(cfg) = PENDING_CONFIG.with(|p| p.borrow().clone()) else {
@@ -408,16 +562,53 @@ pub(super) unsafe extern "system" fn wnd_proc(
         WM_CREATE => {
             build_controls(hwnd);
             fill_from_config(hwnd);
+            enable_dark_titlebar(hwnd);
             LRESULT(0)
         }
-        // 浅色清新主题：静态文本/分组框/复选按钮文字统一深灰蓝，背景浅色
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+        // 静态文本/分组框标题白字；分组区域内用卡片底，底部状态栏用窗口底
+        WM_CTLCOLORSTATIC => {
+            let h = HWND(lparam.0 as *mut core::ffi::c_void);
+            let id = GetWindowLongPtrW(h, GWL_ID) as u32;
             unsafe {
                 let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
-                SetTextColor(hdc, COLORREF(0x44_35_2C)); // RGB(44,53,68)
+                SetTextColor(hdc, COLORREF(0xEC_EA_E8)); // RGB(232,234,236)
                 SetBkMode(hdc, TRANSPARENT);
             }
-            LRESULT(bg_brush().0 as isize)
+            if id == IDC_STATUS {
+                LRESULT(bg_brush().0 as isize)
+            } else {
+                LRESULT(card_brush().0 as isize)
+            }
+        }
+        // 复选按钮白字 + 卡片底（复选都在分组区域内；owner-draw 普通按钮不走这条）
+        WM_CTLCOLORBTN => {
+            unsafe {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+                SetBkMode(hdc, TRANSPARENT);
+                if is_checkbox(HWND(lparam.0 as *mut core::ffi::c_void)) {
+                    SetTextColor(hdc, COLORREF(0xEC_EA_E8));
+                } else {
+                    SetTextColor(hdc, COLORREF(0x22_24_26));
+                }
+            }
+            LRESULT(card_brush().0 as isize)
+        }
+        // 输入框：深底白字（底色与 edit_brush 一致）
+        WM_CTLCOLOREDIT => {
+            unsafe {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+                SetTextColor(hdc, COLORREF(0xF0_F0_F0));
+                SetBkColor(hdc, COLORREF(0x38_3A_3C)); // RGB(60,58,56)
+            }
+            LRESULT(edit_brush().0 as isize)
+        }
+        // owner-draw 按钮：深色圆角自绘
+        WM_DRAWITEM => {
+            unsafe {
+                let di = lparam.0 as *mut DRAWITEMSTRUCT;
+                draw_button(&*di);
+            }
+            LRESULT(1)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
